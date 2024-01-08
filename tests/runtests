@@ -1,0 +1,463 @@
+#!/usr/bin/python3
+import grequests
+import argparse
+import requests
+import subprocess
+import sys
+import socket
+import timeit
+import threading
+import os
+import io
+import traceback
+import time
+import shutil
+sys.path.append('.')
+import start
+
+# Constants
+Q_EMPTY = 598
+Q_FULL = 599
+
+# Args class
+class Args:
+    def __init__(self, l, w, h, p, q):
+        self.lnum = l
+        self.wnum = w
+        self.host = h
+        self.port = p
+        self.qsize = q
+
+# General test
+# The tester calls init, run, and clean, in order
+class Test():
+    def __init__(self, num=1):
+        global server_host, server_port
+        super(Test, self).__init__()
+        self.args = Args(1, 1, server_host, server_port, 1) 
+        self.num = num
+        self.path = ''
+        self.score = 0
+
+    def run(self):
+        self.score = 0
+        print(f'Error: Run not implemented')
+        return self.score
+
+    def run_proxy_server(self):
+        global proxy_process
+        self.proxy_ports = start.find_free_ports(self.args.lnum)
+        proxy_process = start.run_proxy(self.proxy_ports, self.args.lnum, self.args.wnum, 
+                self.args.host, self.args.port, self.args.qsize, test_path)
+
+    def init(self):
+        self.run_proxy_server()
+
+    def clean(self):
+        global proxy_process
+        if proxy_process is not None:
+            proxy_process.terminate()
+
+# ----------------------------------------- Tests ----------------------------------------- #
+
+# Get file from a single port
+class Test1(Test):
+    def __init__(self):
+        super().__init__(1)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 1) 
+        self.desc = 'Get file from a single port'
+
+    def run(self):
+        self.score = 1
+
+        o = send_req_proxy(self.path, self.proxy_ports[0]).content
+        exp_o = send_req(self.path)
+        if o != exp_o:
+            print(f'Px: {o} tg: {exp_o}')
+            self.score = 0
+        return self.score
+
+
+# Get file from two ports
+class Test2(Test):
+    def __init__(self):
+        super().__init__(2)
+        self.path = '1/dummy1.html'
+        self.args = Args(2, 1, server_host, server_port, 2) 
+        self.desc = 'Get file from two ports'
+
+    def run(self):
+        self.score = 1
+
+        o1 = send_req_proxy(self.path, self.proxy_ports[0]).content
+        o2 = send_req_proxy(self.path, self.proxy_ports[1]).content
+
+        exp_o = send_req(self.path)
+        if o1 != exp_o or o2 != exp_o:
+            print(f'Px: {o1} Px: {o2} tg: {exp_o}')
+            self.score = 0
+        return self.score
+
+
+# Batch requests, single worker
+class Test3(Test):
+    def __init__(self):
+        super().__init__(3)
+        self.path = '1/dummy1.html'
+        self.N = 20
+        self.num_runs = 2 
+        self.batch_size = 50 
+        self.args = Args(self.N, 1, server_host, server_port, self.batch_size * self.N) 
+        self.desc = 'Batch requests, single worker'
+    
+    def run(self):
+        self.score = 1
+        urls = []
+        for i in range(self.N):
+            urls.append(f'http://localhost:{self.proxy_ports[i]}/' + self.path)
+
+        for _ in range(self.num_runs):
+            reqs = (grequests.get(urls[i % self.N]) for i in range(self.batch_size))
+
+            # Send all requests
+            responses = grequests.map(reqs)
+
+            server_addr = f'http://{server_host}:{server_port}/'
+            exp_resp = requests.get(server_addr + self.path)
+
+            for r in responses:
+                if exp_resp.content != r.content:
+                    self.score = 0
+                    break
+            if not self.score:
+                break
+        return self.score
+
+
+# Batch requests, multiple workers
+class Test4(Test):
+    def __init__(self):
+        super().__init__(4)
+        self.path = '1/dummy1.html'
+        self.N = 2
+        self.num_runs = 2
+        self.batch_size = 50
+        self.args = Args(self.N, 10, server_host, server_port, self.batch_size * self.N) 
+        self.desc = 'Batch requests, mutiple workers'
+
+    def run(self):
+        self.score = 1
+        urls = []
+        for i in range(self.N):
+            urls.append(f'http://localhost:{self.proxy_ports[i]}/' + self.path)
+
+        for _ in range(self.num_runs):
+            reqs = (grequests.get(urls[i % self.N]) for i in range(self.batch_size))
+
+            # Send all requests
+            responses = grequests.map(reqs)
+
+            server_addr = f'http://{server_host}:{server_port}/'
+            exp_resp = requests.get(server_addr + self.path)
+
+            for r in responses:
+                if exp_resp.content != r.content:
+                    self.score = 0
+                    break
+            if not self.score:
+                break
+        return self.score
+    
+
+# Delay
+class Test5(Test):
+    def __init__(self):
+        super().__init__(5)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 1) 
+        self.delay = 5 # seconds
+        self.desc = 'Delay'
+    
+    def run(self):
+        self.score = 1
+        tstart = timeit.default_timer() # Wallclock time
+        send_req_with_delay(self.path, self.proxy_ports[0], self.delay)
+        tend = timeit.default_timer()
+        tdiff = tend - tstart # Seconds
+        #tms = tdiff * 1000 # ms
+        if tdiff < self.delay:
+            self.score = 0
+            print(f'Should take at least {self.delay}s, but took {tdiff}s')
+        return self.score 
+
+
+# Queue is full
+class Test6(Test):
+    def __init__(self):
+        super().__init__(6)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 1) 
+        self.desc = 'Queue full error'
+    
+    def run(self):
+        self.score = 1
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+        r = send_req_proxy(self.path, self.proxy_ports[0]) # Should fail, queue is full! 
+        # Internal server error
+        if r.status_code != Q_FULL:
+            self.score = 0
+        return self.score 
+
+
+# Empty queue
+class Test7(Test):
+    def __init__(self):
+        super().__init__(7)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 3) 
+        self.priorities = ['3/dummy1.html', '2/dummy1.html']
+        self.order = [1, 0]
+        self.desc = 'Empty queue in GetJob'
+    
+    def run(self):
+        self.score = 1
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+
+        # Send GetJob, should fail becaue queue is empty
+        r = send_get_jobs(self.proxy_ports[0])
+        if r.status_code != Q_EMPTY:
+            print(f'Expected status code {Q_EMPTY}, got {r.status_code}')
+            self.score = 0
+        return self.score 
+
+
+# Single job in the queue
+class Test8(Test):
+    def __init__(self):
+        super().__init__(8)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 3) 
+        self.priorities = ['3/dummy1.html',]
+        self.order = [0,]
+        self.desc = 'GetJob with a single job in the queue'
+    
+    def run(self):
+        self.score = 1
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+        # Submit requests with different priorities
+        for ord in self.order:
+            send_block_request(self.priorities[ord], self.proxy_ports[0])
+            time.sleep(0.5)
+        for i in range(len(self.order)):
+            job = send_get_jobs(self.proxy_ports[0]).text
+            exp_job = '/' + self.priorities[i]
+            job = job[:len(exp_job)]
+            if job != exp_job:
+                self.score = 0
+                print(f'Priority error. Job {i} should be {exp_job},\
+                      but is {job}')
+        return self.score 
+
+
+# Mutiple jobs with different priorities
+class Test9(Test):
+    def __init__(self):
+        super().__init__(9)
+        self.path = '9/dummy1.html'
+        self.args = Args(1, 1, server_host, server_port, 10) 
+        self.priorities = ['5/dummy1.html', '4/dummy1.html', '3/dummy1.html', '2/dummy1.html', '1/dummy1.html']
+        self.order = [2, 4, 0, 3, 1]
+        self.desc = 'GetJob with multiple jobs in the queue'
+    
+    def run(self):
+        self.score = 1
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+        
+        # Submit requests with different priorities
+        for ord in self.order:
+            send_block_request(self.priorities[ord], self.proxy_ports[0])
+
+        # Wait to make sure all requests are put into the queue
+        time.sleep(0.5)
+
+        # Send GetJob mutiple times to get all queued jobs, should be in order
+        for i in range(len(self.order)):
+            job = send_get_jobs(self.proxy_ports[0]).text
+            exp_job = '/' + self.priorities[i]
+            job = job[:len(exp_job)]
+            if job != exp_job:
+                self.score = 0
+                print(f'Priority error. Job {i} should be {exp_job},\
+                      but is {job}')
+        return self.score 
+
+
+# Test the number of worker threads
+class Test10(Test):
+    def __init__(self):
+        super().__init__(10)
+        self.path = '1/dummy1.html'
+        self.args = Args(1, 3, server_host, server_port, 5) 
+        self.desc = 'Number of worker threads'
+    
+    def run(self):
+        self.score = 1
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        send_block_request(self.path, self.proxy_ports[0]) # Keep some threads busy
+        time.sleep(0.5)
+        r = send_req_proxy(self.path, self.proxy_ports[0]) # The extra thread should handle 
+        time.sleep(0.5)
+        send_block_request(self.path, self.proxy_ports[0]) # Keep the last thread busy
+        time.sleep(0.5)
+        try:
+            url = f'http://localhost:{self.proxy_ports[0]}/' + self.path
+            requests.get(url, timeout=5) # Should timeout
+            self.score = 0 # Should not reach here
+            print(f'Request did not time out and returned')
+        except requests.exceptions.Timeout:
+            pass
+        return self.score 
+
+
+# Runs all the tests by calling init, run, clean, respectively
+# Returns total score
+def run_tests(tests):
+    total_score = 0
+    for test in tests:
+        try:
+            print(f'Running test {test.num} ({test.desc})...')
+            test.init()
+            total_score += test.run()
+            if test.score:
+                print(f'Test {test.num} passed')
+            else:
+                print(f'Test {test.num} failed')
+            test.clean()
+        except:
+            test.clean()
+            print(traceback.format_exc())
+
+    return total_score
+
+
+# Sends a get(path) request to the target server at 'server_host:server_port'
+# Returns the content (binary) of the response
+def send_req(path):
+    host = server_host
+    port = server_port
+    b = f'http://{host}:{port}/'
+    url = b + path
+    r = requests.get(url)
+    return r.content
+
+
+# Sends a get(path) request to the proxy server at 'localhost:port'
+# Returns the complete response object
+def send_req_proxy(path, port):
+    host = 'localhost'
+    b = f'http://{host}:{port}/'
+    url = b + path
+    r = requests.get(url)
+    return r
+
+
+# Does the same thing as 'send_req_proxy', but with delay
+# Returns the content of the response
+def send_req_with_delay(path, port, delay):
+    host = 'localhost'
+    b = f'http://{host}:{port}/'
+    url = b + path
+    hdrs = {'Delay': f'{delay}'}
+    r = requests.get(url, headers=hdrs)
+    return r.content
+
+
+# Does the same thing as 'send_req_with_delay', but it's OK if it fails
+# This prevents printing error messages to the screen when using threads
+# This function is always supposed to fail, because it's used for blocking requests
+# with large delays to keep threads busy. Before hearing from the server, the processes
+# are terminated and the other end of the socket is closed.
+# Returns the content of the reponse, but should never return!
+def send_req_with_delay_fail(path, port, delay):
+    host = 'localhost'
+    b = f'http://{host}:{port}/'
+    url = b + path
+    hdrs = {'Delay': f'{delay}'}
+    try:
+    	r = requests.get(url, headers=hdrs)
+    	return r.content
+    except:
+        pass
+
+
+# Launch a new thread to send a request with a long delay
+# This is used to keep threads busy, potentially queuing up some requests in the pq
+# No returns
+def send_block_request(path, port):
+    t = threading.Thread(target=send_req_with_delay_fail, args=(path, port, 100))
+    t.start()
+
+
+# Sends a GetJob command to the proxy server at 'localhost:port'
+# Returns the reponse object
+def send_get_jobs(port):
+    url = f'http://localhost:{port}/GetJob'
+
+    r = requests.get(url)
+    return r
+
+
+# Terminate both target and proxy processes 
+def clean():
+    if target_process is not None:
+        target_process.terminate()
+    if proxy_process is not None:
+        proxy_process.terminate()
+
+    if os.path.exists(test_path):
+        shutil.rmtree(test_path)
+
+
+# Copy files and prepare testing enviornment
+base = '/home/cs537-1/tests/P6/'
+path = os.getcwd() 
+test_path = path + '/testing/'
+if os.path.exists(test_path):
+    shutil.rmtree(test_path)
+shutil.copytree(path, test_path)
+if os.path.exists(test_path + 'public_html/'):
+    shutil.rmtree(test_path + 'public_html/')
+shutil.copytree(base + 'public_html/', test_path + 'public_html/')
+
+# Compile the source for proxyserver
+start.compile(test_path)
+
+
+# Run the target server
+server_host = '127.0.0.1'
+server_port = start.find_free_ports(1)[0]
+target_process = start.run_target(server_host, server_port, test_path + 'public_html/') 
+proxy_process = None
+print(f'Server address: {server_host}:{server_port}')
+
+# Give enough time to the python server to run
+# If the proxy server tries to connect before the python server starts to listen,
+# it would cause it to fail
+time.sleep(0.5)
+
+# Tests to run
+tests = [Test1(), Test2(), Test3(), Test4(), Test5(), Test6(), Test7(), Test8(), Test9(), Test10(),
+         ]
+
+ts = run_tests(tests)
+print(f'Total score: {ts}')
+
+
+clean()
